@@ -1,118 +1,93 @@
-#!/usr/bin/env python
-# Copyright (c) 2015 Christian Gerbrandt <derchris@derchris.eu>
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""
-Python port of William Lam's generateHTML5VMConsole.pl
-Also ported SHA fingerprint fetching to Python OpenSSL library
-"""
-
-import atexit
-import OpenSSL
+#!/usr/bin/env python3
+from pyVim.connect import SmartConnect, Disconnect
+from pyVmomi import vim, vmodl
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+from binascii import hexlify
+from getpass import getpass
 import ssl
-import sys
+import atexit
+import webbrowser
+import argparse
 import time
 
-from pyVim.connect import SmartConnect, Disconnect
-from pyVmomi import vim
-from tools import cli
+def option():
+    parser = argparse.ArgumentParser(prog='vmware_connect_web_console.py',
+                                     add_help=True,
+                                     description='Tool to open VMware web console.')
 
-
-def get_vm(content, name):
-    try:
-        name = unicode(name, 'utf-8')
-    except TypeError:
-        pass
-
-    vm = None
-    container = content.viewManager.CreateContainerView(
-        content.rootFolder, [vim.VirtualMachine], True)
-
-    for c in container.view:
-        if c.name == name:
-            vm = c
-            break
-    return vm
-
-
-def get_args():
-    """
-    Add VM name to args
-    """
-    parser = cli.build_arg_parser()
-
-    parser.add_argument('-n', '--name',
-                        required=True,
-                        help='Name of Virtual Machine.')
-
+    parser.add_argument('--host', '-vc',
+                        type=str, required=True,
+                        help='Specify FQDN or IP address for vCenter.')
+    parser.add_argument('--username', '-u',
+                        type=str, default='administrator@vsphere.local',
+                        help='Specify vCenter username.')
+    parser.add_argument('--password', '-p',
+                        type=str,
+                        help='Specify vCenter user password.')
+    parser.add_argument('--vm-name', '-v',
+                        type=str, required=True,
+                        help='Open web console Specify target vm name.')
     args = parser.parse_args()
 
-    return cli.prompt_for_password(args)
+    if (not (args.password)):
+        args.password = getpass()
 
+    return args
 
 def main():
-    """
-    Simple command-line program to generate a URL
-    to open HTML5 Console in Web browser
-    """
+    # Options.
+    args = option()
 
-    args = get_args()
+    # SSL warning measures.
+    context = None
+    if hasattr(ssl, '_create_unverified_context'):
+        context = ssl._create_unverified_context()
 
-    try:
-        si = SmartConnect(host=args.host,
-                          user=args.user,
-                          pwd=args.password,
-                          port=int(args.port))
-    except Exception as e:
-        print 'Could not connect to vCenter host'
-        print repr(e)
-        sys.exit(1)
-
+    # Server Connect.
+    si = SmartConnect(host=args.host,
+                      user=args.username,
+                      pwd=args.password,
+                      sslContext=context)
     atexit.register(Disconnect, si)
 
-    content = si.RetrieveContent()
+    # Get content and obj list.
+    content = si.content
+    obj_list = content.viewManager.CreateContainerView(content.rootFolder,
+                                                       [vim.VirtualMachine],
+                                                       True)
 
-    vm = get_vm(content, args.name)
-    vm_moid = vm._moId
+    # Get VM Object.
+    vm_obj = None
+    for obj in obj_list.view:
+        if(obj.name == args.vm_name):
+            vm_obj = obj
 
-    vcenter_data = content.setting
-    vcenter_settings = vcenter_data.setting
-    console_port = '7331'
+    if(vm_obj):
+        # Create Session Ticket.
+        session = content.sessionManager.AcquireCloneTicket()
 
-    for item in vcenter_settings:
-        key = getattr(item, 'key')
-        if key == 'VirtualCenter.FQDN':
-            vcenter_fqdn = getattr(item, 'value')
+        # Create ServerGuid.
+        server_guid = content.about.instanceUuid
 
-    session_manager = content.sessionManager
-    session = session_manager.AcquireCloneTicket()
+        # Get fingerprint.
+        cert = ssl.get_server_certificate((args.host, 443))
+        cert_deserialize = x509.load_pem_x509_certificate(cert.encode(), default_backend())
+        finger_print = hexlify(cert_deserialize.fingerprint(hashes.SHA1())).decode('utf-8')
+        finger_print_format = ":".join([finger_print[i: i+2] for i in range(0, len(finger_print), 2)])
 
-    vc_cert = ssl.get_server_certificate((args.host, int(args.port)))
-    vc_pem = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM,
-                                             vc_cert)
-    vc_fingerprint = vc_pem.digest('sha1')
+        # Create Console URL.
+        web_console_url = 'https://' + args.host + ':' + '9443' + '/vsphere-client/webconsole.html?' + 'vmId=' + vm_obj._moId \
+                          + '&vmName=' + vm_obj.name + '&serverGuid=' + server_guid + '&host=' + args.host + ':443' \
+                          + '&sessionTicket=' + session + '&thumbprint=' + finger_print_format.upper()
 
-    print "Open the following URL in your browser to access the " \
-          "Remote Console.\n" \
-          "You have 60 seconds to open the URL, or the session" \
-          "will be terminated.\n"
-    print "http://" + args.host + ":" + console_port + "/console/?vmId=" \
-          + str(vm_moid) + "&vmName=" + args.name + "&host=" + vcenter_fqdn \
-          + "&sessionTicket=" + session + "&thumbprint=" + vc_fingerprint
-    print "Waiting for 60 seconds, then exit"
-    time.sleep(60)
+        # Open URL.
+        print(web_console_url)
+        time.sleep(60)
+        # webbrowser.open(web_console_url)
+    else:
+        print("%s not found." % args.vm_name)
 
-# Start program
 if __name__ == "__main__":
     main()
